@@ -43,14 +43,37 @@ pnpm pack --pack-destination ./dist
 
 ## 零配置时它怎么找到东西
 
+从 v1.1.0 起，**默认只监视白名单目录**（见下一节）。旧版本「发现 profile 里所有 `link:` 包就全部递归监视」的做法已经废弃：它会把每轮对话都在写盘的插件（如 `dsh-memory-evolve`）也算成「开发目录」，一次会话就能刷出上亿条 watch 事件。
+
 | 需要的东西 | 自动发现方式 |
 | --- | --- |
 | profile 目录 | `profileContext.dir` → `ctx.baseUrl` → 宿主进程参数里的绝对路径 → `$DSH_HOME/profiles/desktop`，取第一个"像 profile"的目录 |
-| 要监视的源码目录 | 读该 profile 的 `package.json`，取 `link:` / `file:` 依赖的真实目录；再加 `node_modules` 顶层（含 `@scope/pkg`）所有 symlink 的真实目录 |
+| 要监视的源码目录 | **白名单内**那些确实被 `link:` / `file:` 依赖进 profile 的包（`autoDiscover: 'whitelist'`，默认） |
 | 要轻触的 patch 文件 | `<profile>/cordis.patch.yml` |
-| 日志 | `os.tmpdir()/dsh-dev-hotreload.log` |
+| 日志 | `os.tmpdir()/dsh-dev-hotreload.log`，超过 **50 MB** 自动轮转成 `.log.1`（只保留一份） |
 
 `node_modules`、`.git`、`dist`、`build`、`out`、`coverage`、`cache` 等目录里的写入会被忽略。
+
+## 白名单（默认值）
+
+内置默认白名单是这台机器上我们自己的 4 个开发目录：
+
+```text
+E:\dsh-a2a-bus\dsh-a2a
+E:\dsh-a2a-bus\dsh-collab-secretary
+E:\dsh-a2a-bus\dsh-tool-switchboard
+E:\dsh-a2a-bus\open-repos\dsh-dev-hotreload
+```
+
+规则（`autoDiscover` 的语义）：
+
+| `autoDiscover` | 行为 |
+| --- | --- |
+| 不写 / `'whitelist'` / `true` | **默认**。白名单是上界：`dirs` 显式目录和自动发现结果都必须在白名单内，`autoDiscover` 只负责在白名单里挑出真的被 link 的包，**不会自行扩大范围**。白名单外的目录会以 `skip (not in whitelist): ...` 记进日志，不静默。 |
+| `false` / `'off'` | 只监视 `dirs` 里显式列出的目录（仍受白名单约束）。 |
+| `'all'` / `'legacy'` | **回到 v1.0 的旧行为**：发现 profile 里所有 `link:` 包并全部监视，绕过白名单。只在真的需要时用。 |
+
+路径比较前会先规范化：去掉零宽字符/BOM 等不可见字符、统一斜杠、去掉尾随分隔符，并**小写化**（Windows 路径大小写不敏感）。
 
 ## 配置（可选）
 
@@ -59,30 +82,81 @@ pnpm pack --pack-destination ./dist
 ```yaml
 - id: dev-hotreload
   config:
-    dirs:                       # 额外监视的目录（自动发现之外）
+    whitelist:                  # 整个替换内置白名单（不是追加）
       - 'D:\Coding\project\dsh\plugins\my-plugin'
-    autoDiscover: true          # 默认 true：自动发现 link: 依赖
+    dirs:                       # 额外/显式监视的目录（仍受白名单约束）
+      - 'D:\Coding\project\dsh\plugins\my-plugin'
+    autoDiscover: whitelist     # 默认；'off' 只盯 dirs；'all' 回到旧的全量发现
+    log: 'D:\Coding\tmp\dev-hotreload.log'   # 默认 tmpdir 下；false 关闭
+    logMaxBytes: 52428800       # 日志上限，默认 50 MB，超过即轮转成 .1
     profile: 'D:\...\profiles\desktop'   # 默认自动定位
     patch: 'D:\...\profiles\desktop\cordis.patch.yml'  # 默认 <profile>/cordis.patch.yml
-    log: 'D:\Coding\tmp\dev-hotreload.log'             # 默认 tmpdir 下；false 关闭
     debounce: 400               # 毫秒
 ```
 
-只想监视指定目录、不要自动发现：
+想加一个自己的开发目录，最省事是**列出完整白名单**（`whitelist` 是整体替换）：
 
 ```yaml
 - id: dev-hotreload
   config:
-    autoDiscover: false
-    dirs:
+    whitelist:
+      - 'E:\dsh-a2a-bus\dsh-a2a'
+      - 'E:\dsh-a2a-bus\dsh-collab-secretary'
+      - 'E:\dsh-a2a-bus\dsh-tool-switchboard'
+      - 'E:\dsh-a2a-bus\open-repos\dsh-dev-hotreload'
       - 'D:\repo\my-plugin'
 ```
 
+## 为什么不监视记忆插件
+
+`dsh-memory-evolve` 这类插件**每轮对话都会写自己的文件**（memory/user/project/daily 四条轨）。把它当"开发目录"递归监视，等于把「正常业务写盘」当成「源码保存」，于是：
+
+- 每一轮对话都触发一次 tick + 一次 profile 重组合（性能开销与"改配置"同级），
+- 每条事件都写一行日志 —— 实测一天 5400 万条，日志连同其它包一起涨到 **12.65 GB / 1.95 亿行**，最后把宿主拖垮。
+
+所以白名单只放「我们自己写代码、保存不频繁」的目录。开发记忆插件时，把它加进 `whitelist` 临时开一会儿即可，写完记得移出。
+
+## 日志轮转
+
+`log()` 每次写之前用 `statSync` 看一眼当前大小，超过 `logMaxBytes`（默认 50 MB）就把主文件 `rename` 成 `.log.1`（覆盖旧的那份），下一次 append 自然重建主文件。
+
+**为什么不用「读整个文件再重写」**：日志曾经到过 12 GB，任何 `readFileSync` + `writeFileSync` 的做法都会在轮转那一刻把宿主（和它的内存）拖死；而 `rename` 是 O(1) 的目录操作，不碰文件内容。因此磁盘占用上界是 `2 × logMaxBytes`。
+
 ## 验证它真的在工作
 
-1. 编辑任意 linked 包里被 `import` 到的文件（比如 `src/tools.js`）；
-2. 看日志：`Get-Content "$env:TEMP\dsh-dev-hotreload.log" -Tail 20`，应出现 `change: src/...` 和 `ticked cordis.patch.yml`；
+1. 编辑白名单里任意包里被 `import` 到的文件（比如 `src/tools.js`）；
+2. 看日志：`Get-Content "$env:TEMP\dsh-dev-hotreload.log" -Tail 20`，应出现 `watching <dir>`、`change: src/...` 和 `ticked cordis.patch.yml`；
 3. 宿主里立刻能用到改后的行为（比如工具输出变了），说明插件已热替换。
+
+不带 profile 环境、直接验证白名单与轮转逻辑：
+
+```bash
+node scripts/verify-acceptance.mjs
+```
+
+## 监视目录被删了会怎样（v1.2.0 起会自愈）
+
+这是本插件最容易踩的坑，值得单独说。
+
+**旧版（≤1.1.0）**：被监视的目录一旦被删除（`git checkout` 切分支、`rm -rf`、移动目录都会触发），`fs.watch` 的句柄会绑死在已消失的目录对象上变成僵尸，此后：
+
+- 每 ~300μs 触发一次 `change: \\?\<绝对路径>`
+- 每次都重置 debounce，`tick()` 永远排不上 → **热重载整体失效**
+- 日志一天能涨到 12.65 GB（实测）
+- **把目录重建回来也救不回**，唯一解是重启宿主
+
+**v1.2.0 的四层防线**（互相独立，任何一层生效都能避免上述结局）：
+
+| 防线 | 做法 |
+|---|---|
+| ① 事件过滤 | 回调里先判断路径是否存在，僵尸句柄报的都是已消失的路径，直接丢弃 |
+| ② tick 节流 | 首次触发后**固定** debounce 到期，中途事件只计数不重排 → 即使狂刷，tick 也按固定节拍发生，永不被饿死 |
+| ③ 自愈 | 连续 200 次「路径不存在」或收到 `error` 就关掉旧 watcher；目录一回来立即重绑（实测 58ms） |
+| ④ 日志限速 | 同一路径每秒最多记一条，其余合并成 `(suppressed N)` |
+
+实测：删除被监视目录 1.5 秒内 **0 条** change 日志（旧版会是数千~数万条），目录回来 58ms 内自动重绑并恢复工作。
+
+**即便如此，仍然建议**：不要删除正在被监视的目录。要换位置就改 `whitelist` 配置。
 
 ## 须知 / 限制
 
@@ -90,6 +164,8 @@ pnpm pack --pack-destination ./dist
 - 保存后有一次重组合，性能开销与"改配置"同级；`debounce` 可调。
 - 重组合失败时 dsh-hmr 不会回滚到旧版本 —— 改坏代码会看到插件 `failed`，修好再保存即可恢复。
 - 只对**会重新执行 `apply`** 的宿主侧代码生效；纯 client（浏览器侧）bundle 的更新由 client-hmr 负责，视插件是否声明 `dsh.client` 而定。
+- `DEFAULT_WHITELIST` 里是本机路径。**别人克隆后这些目录不存在，会被静默跳过**（不报错、不监视任何目录）；改成自己的目录请配 `whitelist` 或 `dirs`。
+- 分支专属的包（只存在于某个分支）应放在常驻 worktree 里再进白名单，不要直接指向主工作树 —— 切分支会让它消失。
 
 ## 开发
 

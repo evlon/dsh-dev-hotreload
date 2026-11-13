@@ -1,9 +1,12 @@
 # dsh-dev-hotreload — bundle 层：注册「保存即热重载」桥。
 #
-# 默认零配置：插件会自动发现当前 profile 里所有 `link:` / `file:` 依赖
-# 指向的本地源码目录，并轻触 profile 的 cordis.patch.yml 触发官方重组合。
-# 要改成显式目录或关闭自动发现，在 profile 的 cordis.patch.yml 里用同 id
-# 覆盖 config（配置会整体替换）。
+# 默认零配置：只监视内置白名单（我们自己的 4 个开发目录），并在白名单内
+# 挑出确实被 `link:` / `file:` 依赖进 profile 的包；日志 50 MB 轮转。
+# 不再「发现 profile 里所有 link: 包就全部递归监视」——那会把每轮对话都在
+# 写盘的 dsh-memory-evolve 也算进去（实测一天 5400 万条事件 / 日志 12 GB）。
+#
+# 要改白名单、调日志上限，或回到旧的全量发现（autoDiscover: 'all'），在
+# profile 的 cordis.patch.yml 里用同 id 覆盖 config（配置会整体替换）。
 - insert:
     - id: dev-hotreload
       name: dsh-dev-hotreload
